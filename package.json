@@ -1,0 +1,8 @@
+{
+  "name": "fulservice-demo",
+  "version": "1.0.0",
+  "description": "Proyecto demo para probar el agente Aprobador de PRs (CC-13658)",
+  "main": "src/index.js",
+  "scripts": { "test": "echo \"(sin tests)\" && exit 0" },
+  "license": "MIT"
+}
