@@ -4,4 +4,8 @@ function capitalizar(texto) {
   return texto.charAt(0).toUpperCase() + texto.slice(1);
 }
 
-module.exports = { capitalizar };
+function invertir(texto) {
+  return String(texto).split('').reverse().join('');
+}
+
+module.exports = { capitalizar, invertir };
