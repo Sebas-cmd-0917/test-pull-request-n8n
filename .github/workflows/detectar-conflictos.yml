@@ -31,7 +31,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Descargar el repo (rama principal, historial completo)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: ${{ github.event.repository.default_branch }}
           fetch-depth: 0
@@ -50,6 +50,9 @@ jobs:
           # Lo ejecuta GitHub Actions automaticamente; nadie tiene que correrlo a mano.
           #  - En cada PR: prueba el merge contra la rama base (main) y contra los demas PRs abiertos.
           #  - En cada push a main: revisa si algun PR abierto quedo en conflicto con main.
+          # GitHub Actions ejecuta con "bash -e": aqui se desactiva porque un conflicto detectado
+          # (codigo 1) es un resultado esperado, no un error del script.
+          set +e
           set -uo pipefail
 
           REPO="${REPO:?falta REPO}"
@@ -102,10 +105,20 @@ jobs:
           }
 
           notify() {
-            if [ -z "${DISCORD_WEBHOOK_URL:-}" ]; then echo "(sin DISCORD_WEBHOOK_URL: no se envia a Discord)"; return; fi
-            jq -n --arg c "${1:0:1900}" '{content: $c, allowed_mentions: {parse: []}}' \
-              | curl -sS -X POST -H "Content-Type: application/json" -d @- "$DISCORD_WEBHOOK_URL" >/dev/null \
-              || echo "(no se pudo avisar a Discord)"
+            local url code
+            # tolera espacios, saltos de linea o comillas pegados por error en el secret
+            url="$(printf '%s' "${DISCORD_WEBHOOK_URL:-}" | tr -d ' \r\n"'"'"'')"
+            if [ -z "$url" ]; then
+              echo "::warning::Falta el secret DISCORD_WEBHOOK_URL: no se envio el aviso a Discord."
+              return
+            fi
+            code="$(jq -n --arg c "${1:0:1900}" '{content: $c, allowed_mentions: {parse: []}}' \
+              | curl -sS -o /dev/null -w '%{http_code}' -X POST -H "Content-Type: application/json" -d @- "$url" 2>/dev/null)"
+            if [ "${code:0:1}" = "2" ]; then
+              echo "Aviso enviado a Discord (HTTP $code)."
+            else
+              echo "::warning::Discord no acepto el aviso (HTTP ${code:-sin respuesta}). Revisa el valor del secret DISCORD_WEBHOOK_URL."
+            fi
           }
 
           # ---------- Modo PR: se abrio o actualizo un PR ----------
