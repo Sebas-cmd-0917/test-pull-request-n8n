@@ -3,75 +3,79 @@
 #   .github/workflows/detectar-conflictos.yml   (y subelo a la rama principal)
 # y crea el secret DISCORD_WEBHOOK_URL en Settings > Secrets and variables > Actions.
 #
-# Que hace (solo, sin que nadie corra nada):
-#  - En cada PR (abierto/actualizado): prueba el merge real contra la rama principal y
-#    contra los demas PRs abiertos. Si choca, avisa a Discord con archivo y lineas.
-#    Si choca con la rama principal, el check queda en rojo.
-#  - Cuando algo se integra a la rama principal: avisa que PRs abiertos quedaron en conflicto.
+# Se dispara con cada "git push" (no hacen falta Pull Requests):
+#  - Push de una rama de trabajo: prueba el merge real contra la rama principal y contra
+#    las demas ramas activas. Si choca, avisa a Discord con archivo y lineas.
+#  - Push a la rama principal (algo se integro): avisa que ramas quedaron en conflicto.
 # Funciona con cualquier nombre de rama principal (main, master, develop...).
+# Nota: una rama creada ANTES de agregar este archivo debe traer la rama principal
+# (git merge main) para empezar a ser revisada.
 name: Detectar conflictos
 
 on:
-  pull_request_target:
-    types: [opened, synchronize, reopened]
   push:
+    branches: ['**']
 
 permissions:
   contents: read
-  pull-requests: read
 
 concurrency:
-  group: conflictos-${{ github.event.pull_request.number || github.ref }}
+  group: conflictos-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   conflictos:
-    # En pushes solo corre si es la rama principal del repo
-    if: github.event_name != 'push' || github.ref_name == github.event.repository.default_branch
+    if: github.event.deleted != true
     runs-on: ubuntu-latest
     steps:
-      - name: Descargar el repo (rama principal, historial completo)
+      - name: Descargar el repo (historial completo)
         uses: actions/checkout@v5
         with:
-          ref: ${{ github.event.repository.default_branch }}
           fetch-depth: 0
 
       - name: Revisar conflictos y avisar a Discord
         env:
-          GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
+          PRINCIPAL: ${{ github.event.repository.default_branch }}
+          RAMA: ${{ github.ref_name }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          PR_BRANCH: ${{ github.event.pull_request.head.ref }}
-          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
-          BASE_BRANCH: ${{ github.event.pull_request.base.ref || github.event.repository.default_branch }}
         run: |
           # Detecta conflictos REALES de git (archivo + lineas) y avisa a Discord.
-          # Lo ejecuta GitHub Actions automaticamente; nadie tiene que correrlo a mano.
-          #  - En cada PR: prueba el merge contra la rama base (main) y contra los demas PRs abiertos.
-          #  - En cada push a main: revisa si algun PR abierto quedo en conflicto con main.
+          # Se dispara con cada "git push" (no hacen falta Pull Requests):
+          #  - Push de una rama de trabajo: prueba integrarla en la rama principal y contra las
+          #    demas ramas activas. Si choca con la principal, la corrida queda en rojo.
+          #  - Push a la rama principal: revisa que ramas activas quedaron en conflicto.
           # GitHub Actions ejecuta con "bash -e": aqui se desactiva porque un conflicto detectado
           # (codigo 1) es un resultado esperado, no un error del script.
           set +e
           set -uo pipefail
 
           REPO="${REPO:?falta REPO}"
-          BASE_BRANCH="${BASE_BRANCH:-main}"
-          PR_NUMBER="${PR_NUMBER:-}"
+          PRINCIPAL="${PRINCIPAL:?falta PRINCIPAL}"
+          RAMA="${RAMA:?falta RAMA}"
           SERVER="${GITHUB_SERVER_URL:-https://github.com}"
+          DIAS="${DIAS_ACTIVAS:-30}"      # ramas sin commits en este tiempo se ignoran
 
           git config user.email "conflictos@bot.local"
           git config user.name "detector-conflictos"
-          git fetch -q origin '+refs/heads/*:refs/remotes/origin/*'
+          git fetch -q --prune origin '+refs/heads/*:refs/remotes/origin/*'
 
-          # PRs abiertos: numero<TAB>rama<TAB>autor<TAB>base
-          if [ -n "${PRS_OVERRIDE:-}" ]; then
-            PRS_TSV="$PRS_OVERRIDE"
-          else
-            PRS_TSV="$(gh pr list --repo "$REPO" --state open --limit 100 \
-              --json number,headRefName,author,baseRefName \
-              --jq '.[] | [.number, .headRefName, .author.login, .baseRefName] | @tsv')"
-          fi
+          autor() { git log -1 --format='%an' "origin/$1" 2>/dev/null; }
+
+          # Ramas activas: no la principal, no integradas todavia, con commits recientes
+          activas() {
+            local ahora b ts
+            ahora="$(date +%s)"
+            git for-each-ref --format='%(refname)' refs/remotes/origin | sed 's#^refs/remotes/origin/##' | while IFS= read -r b; do
+              [ "$b" = "HEAD" ] && continue
+              [ "$b" = "$PRINCIPAL" ] && continue
+              git merge-base --is-ancestor "origin/$b" "origin/$PRINCIPAL" 2>/dev/null && continue
+              ts="$(git log -1 --format=%ct "origin/$b" 2>/dev/null)"
+              [ -z "$ts" ] && continue
+              [ $(( ahora - ts )) -gt $(( DIAS * 86400 )) ] && continue
+              printf '%s\n' "$b"
+            done
+          }
 
           # simulate <base> <pre|""> <candidata>
           #   Integra <pre> (si se da) y luego prueba integrar <candidata>.
@@ -121,68 +125,60 @@ jobs:
             fi
           }
 
-          # ---------- Modo PR: se abrio o actualizo un PR ----------
-          if [ -n "$PR_NUMBER" ]; then
-            CAND="origin/${PR_BRANCH:?falta PR_BRANCH}"
-            BASE="origin/$BASE_BRANCH"
-            MSG=""; BLOQUEA=0
+          ACTIVAS="$(activas)"
 
-            out="$(simulate "$BASE" "" "$CAND")"; rc=$?
+          # ---------- Push de una rama de trabajo ----------
+          if [ "$RAMA" != "$PRINCIPAL" ]; then
+            MSG=""; BLOQUEA=0
+            out="$(simulate "origin/$PRINCIPAL" "" "origin/$RAMA")"; rc=$?
             if [ $rc -eq 1 ]; then
               BLOQUEA=1
-              MSG+="🔴 Choca con \`$BASE_BRANCH\`:"$'\n'"$out"$'\n'
+              MSG+="🔴 Choca con \`$PRINCIPAL\`:"$'\n'"$out"$'\n'
+            else
+              # Solo se compara contra otras ramas si esta limpia contra la principal
+              while IFS= read -r otra; do
+                [ -z "$otra" ] && continue
+                [ "$otra" = "$RAMA" ] && continue
+                out="$(simulate "origin/$PRINCIPAL" "origin/$otra" "origin/$RAMA")"; rc=$?
+                if [ $rc -eq 1 ]; then
+                  MSG+="🟠 Choca con la rama \`$otra\` (de $(autor "$otra")) si se integra despues de esa:"$'\n'"$out"$'\n'
+                fi
+              done <<< "$ACTIVAS"
             fi
-
-            # Solo se compara contra otros PRs si el PR esta limpio contra la base
-            # (si ya choca con main, ese es el problema a resolver primero).
-            [ $BLOQUEA -eq 1 ] && PRS_TSV=""
-
-            while IFS=$'\t' read -r n br au bb; do
-              [ -z "${n:-}" ] && continue
-              [ "$n" = "$PR_NUMBER" ] && continue
-              [ "$bb" != "$BASE_BRANCH" ] && continue
-              git rev-parse -q --verify "origin/$br" >/dev/null || continue
-              out="$(simulate "$BASE" "origin/$br" "$CAND")"; rc=$?
-              if [ $rc -eq 1 ]; then
-                MSG+="🟠 Choca con el PR #$n (\`$br\`, de $au) si se integra despues de ese:"$'\n'"$out"$'\n'
-              fi
-            done <<< "$PRS_TSV"
 
             if [ -n "$MSG" ]; then
               FULL="⚠️ **Conflicto de ramas** — $REPO"$'\n'
-              FULL+="PR #$PR_NUMBER (\`$PR_BRANCH\`, de ${PR_AUTHOR:-?}): $SERVER/$REPO/pull/$PR_NUMBER"$'\n'
-              FULL+="$MSG"$'\n'"No integrar hasta coordinar con el otro dueño de rama."
+              FULL+="Rama \`$RAMA\` (de $(autor "$RAMA")): $SERVER/$REPO/tree/$RAMA"$'\n'
+              FULL+="$MSG""No integrar hasta coordinar con el otro dueño de rama."
               echo "$FULL"
               notify "$FULL"
               if [ $BLOQUEA -eq 1 ]; then
-                echo "::error::El PR choca con $BASE_BRANCH. Actualiza la rama y resuelve antes de integrar."
+                echo "::error::La rama $RAMA choca con $PRINCIPAL. Actualizala y resuelve antes de integrar."
                 exit 1
               fi
-              echo "::warning::El PR choca con otros PRs abiertos (ver aviso en Discord)."
+              echo "::warning::La rama $RAMA choca con otras ramas activas (ver aviso en Discord)."
             else
-              echo "Sin conflictos: el PR #$PR_NUMBER no choca con $BASE_BRANCH ni con otros PRs abiertos."
+              echo "Sin conflictos: $RAMA no choca con $PRINCIPAL ni con otras ramas activas."
             fi
             exit 0
           fi
 
-          # ---------- Modo push a main: algo se integro, revisar los PRs abiertos ----------
+          # ---------- Push a la rama principal: algo se integro ----------
           MSG=""
-          while IFS=$'\t' read -r n br au bb; do
-            [ -z "${n:-}" ] && continue
-            [ "$bb" != "$BASE_BRANCH" ] && continue
-            git rev-parse -q --verify "origin/$br" >/dev/null || continue
-            out="$(simulate "origin/$BASE_BRANCH" "" "origin/$br")"; rc=$?
+          while IFS= read -r b; do
+            [ -z "$b" ] && continue
+            out="$(simulate "origin/$PRINCIPAL" "" "origin/$b")"; rc=$?
             if [ $rc -eq 1 ]; then
-              MSG+="- PR #$n (\`$br\`, de $au): $SERVER/$REPO/pull/$n"$'\n'"$out"$'\n'
+              MSG+="- \`$b\` (de $(autor "$b")): $SERVER/$REPO/tree/$b"$'\n'"$out"$'\n'
             fi
-          done <<< "$PRS_TSV"
+          done <<< "$ACTIVAS"
 
           if [ -n "$MSG" ]; then
-            FULL="⚠️ **Tras el ultimo cambio en \`$BASE_BRANCH\`** ($REPO), estos PRs ahora chocan:"$'\n'"$MSG"
-            FULL+=$'\n'"Sus dueños deben actualizar la rama con \`$BASE_BRANCH\` y resolver."
+            FULL="⚠️ **Tras el ultimo cambio en \`$PRINCIPAL\`** ($REPO), estas ramas ahora chocan:"$'\n'"$MSG"
+            FULL+="Sus dueños deben actualizar la rama con \`$PRINCIPAL\` y resolver."
             echo "$FULL"
             notify "$FULL"
           else
-            echo "Ningun PR abierto choca con $BASE_BRANCH."
+            echo "Ninguna rama activa choca con $PRINCIPAL."
           fi
           exit 0
